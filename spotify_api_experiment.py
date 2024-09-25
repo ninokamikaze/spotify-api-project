@@ -1,47 +1,62 @@
 import pandas as pd
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
-import matplotlib.pyplot as plt
 import requests
-import pdb
+from bs4 import BeautifulSoup
+from io import StringIO  # Importar StringIO para manejar la cadena HTML
 
 # Configuración inicial de Spotify API
 client_id = '785e1007323d4db3908b4c93764e9475'
 client_secret = '41a16fe64c6b418a8116bab69309e82f'
 redirect_uri = 'http://localhost:8080/callback'
 
-# Autenticación con OAuth 2.0
-scope = "user-top-read"  # Permiso para acceder a las canciones más escuchadas del usuario
+# Autenticación con OAuth 2.0 para Spotify
+scope = "user-top-read"
 sp = spotipy.Spotify(auth_manager=SpotifyOAuth(client_id=client_id, client_secret=client_secret, redirect_uri=redirect_uri, scope=scope))
 
-# Obtener las 30 canciones más reproducidas del usuario
-top_tracks = sp.current_user_top_tracks(limit=10)
+# Función para obtener el top de un país específico desde Kworb.net, con un límite de canciones
+def get_kworb_top(country_code='ec', limit=20):
+    """
+    Obtiene el Top 200 de Spotify de un país específico desde Kworb.net con un límite de canciones.
+    
+    Args:
+    - country_code: El código del país (por ejemplo, 'us' para Estados Unidos, 'ec' para Ecuador).
+    - limit: El número de canciones a obtener (ejemplo: 20).
 
-# Extraer datos importantes de cada canción y crear un DataFrame
-track_data = [{
-    'name': track['name'],
-    'artist': track['artists'][0]['name'],
-    'album': track['album']['name'],
-    'popularity': track['popularity'],
-    'track_id': track['id']  # Guardamos el ID de la canción para obtener sus características de audio
-} for track in top_tracks['items']]
+    Returns:
+    - Un DataFrame con las canciones del Top y sus datos relevantes.
+    """
+    url = f'https://kworb.net/spotify/country/{country_code}_daily.html'
+    response = requests.get(url)
+    
+    # Forzar la codificación UTF-8 para evitar problemas con caracteres especiales
+    response.encoding = 'utf-8'  # Asegurar que la respuesta sea leída como UTF-8
 
-df_tracks = pd.DataFrame(track_data)
+    # Verificar si la solicitud fue exitosa
+    if response.status_code != 200:
+        print(f"Error al acceder a los datos de Kworb para {country_code}. Status Code: {response.status_code}")
+        return pd.DataFrame()
 
-# Obtener características de audio de cada canción
-audio_features = [{
-    'id': features['id'],
-    'energy': features['energy'],
-    'tempo': features['tempo'],
-    'danceability': features['danceability'],
-    'loudness': features['loudness']
-} for features in sp.audio_features(df_tracks['track_id'])]
+    # Usar BeautifulSoup para extraer la tabla
+    soup = BeautifulSoup(response.text, 'html.parser')
+    table = soup.find('table')  # Buscar la tabla principal
 
-# Crear un DataFrame con las características de audio
-df_audio_features = pd.DataFrame(audio_features)
+    # Leer la tabla en un DataFrame y limitar el número de filas según el parámetro 'limit'
+    df_kworb = pd.read_html(StringIO(str(table)))[0].head(limit)
 
-# Combinar ambos DataFrames (canciones + características de audio)
-df_combined = pd.merge(df_tracks, df_audio_features, left_on='track_id', right_on='id')
+    # Ver la estructura original de la tabla
+    print("Estructura original de la tabla Kworb:\n", df_kworb.head())
+
+    # Dividir la columna "Artist and Title" en dos columnas: 'Artista' y 'Nombre'
+    df_kworb[['Artista', 'Nombre']] = df_kworb['Artist and Title'].str.split(' - ', expand=True)
+
+    # Limpiar el nombre de la canción eliminando cualquier texto que venga después de "(w/"
+    df_kworb['Nombre'] = df_kworb['Nombre'].str.split(r' \(w/').str[0].str.strip()
+
+    # Seleccionamos únicamente las columnas relevantes para continuar el análisis
+    df_kworb = df_kworb[['Artista', 'Nombre']]  # Ahora tenemos solo las columnas limpias
+
+    return df_kworb
 
 # Función para obtener la ubicación del artista desde la API de MusicBrainz
 def get_artist_country(artist_name):
@@ -61,19 +76,57 @@ def get_artist_country(artist_name):
         print(f"Error: {response.status_code}")
         return 'Error'
 
+# Obtener el top del país (por ejemplo, Ecuador) desde Kworb.net con un límite de 20 artistas
+df_kworb = get_kworb_top('ec', limit=20)
+
+if df_kworb.empty:
+    print("No se pudo obtener el Top 200 de Kworb.")
+else:
+    print("Cargando lista...")
+
+# Obtener las características de audio de las canciones del top a través de la API de Spotify
+audio_features = []
+for index, row in df_kworb.iterrows():
+    query = f"track:{row['Nombre']} artist:{row['Artista']}"
+    search_result = sp.search(q=query, type='track', limit=1)
+    
+    if search_result['tracks']['items']:
+        track = search_result['tracks']['items'][0]
+        track_id = track['id']  # Obtener el ID del track
+        
+        # Obtener las características de audio usando el ID de la canción
+        features = sp.audio_features(track_id)[0]
+        if features:
+            audio_features.append({
+                'name': row['Nombre'],
+                'artist': row['Artista'],
+                'id': track_id,
+                'energy': features['energy'],
+                'tempo': features['tempo'],
+                'danceability': features['danceability'],
+                'loudness': features['loudness']
+            })
+        else:
+            print(f"No se encontraron características de audio para {row['Nombre']} - {row['Artista']}")
+    else:
+        print(f"No se encontró la canción {row['Nombre']} de {row['Artista']} en Spotify.")
+
+# Crear un DataFrame con las características de audio
+df_audio_features = pd.DataFrame(audio_features)
+
 # Agregar la columna 'country' con la ubicación de cada artista
-df_combined['country'] = df_combined['artist'].apply(get_artist_country)
+df_audio_features['country'] = df_audio_features['artist'].apply(get_artist_country)
 
 # Limpieza: Reemplazar 'Desconocido' por 'N/A'
-df_combined['country'] = df_combined['country'].replace('Desconocido', 'N/A')
+df_audio_features['country'] = df_audio_features['country'].replace('Desconocido', 'N/A')
 
 # Mostrar el DataFrame con todas las columnas
-print("\nTus canciones más reproducidas:")
-print(df_combined[['name', 'artist', 'energy', 'tempo', 'danceability', 'loudness', 'country']])
+print("\nTop de canciones con características de audio y país:")
+print(df_audio_features[['name', 'artist', 'energy', 'tempo', 'danceability', 'loudness', 'country']])
 
 # Guardar los datos en un archivo CSV
-df_combined.to_csv('top_tracks_with_audio_features.csv', index=False)
-print("\nDatos guardados en 'top_tracks_with_audio_features.csv'")
+df_audio_features.to_csv('kworb_top_tracks_with_audio_features.csv', index=False)
+print("\nDatos guardados en 'kworb_top_tracks_with_audio_features.csv'")
 
 # Crear el gráfico de distribución de energía
 # plt.figure(figsize=(10, 6))  # Define el tamaño del gráfico
